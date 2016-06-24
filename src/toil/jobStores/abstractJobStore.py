@@ -132,6 +132,39 @@ class AbstractJobStore(object):
     """
     __metaclass__ = ABCMeta
 
+    class Locator(object):
+        @classmethod
+        def parse(cls, s):
+            l = s.split(':')
+            if l[0] == 'aws':
+                from toil.jobStores.aws.jobStore import AWSJobStore
+                return AWSJobStore.Locator.parse(l[1:])
+            elif l[0] == 'azure':
+                from toil.jobStores.azureJobStore import AzureJobStore
+                return AzureJobStore.Locator.parse(l[1:])
+            elif l[0] == 'google':
+                from toil.jobStores.googleJobStore import GoogleJobStore
+                return GoogleJobStore.Locator.parse(l[1:])
+            elif l[0] == 'file':
+                from toil.jobStores.fileJobStore import FileJobStore
+                return FileJobStore.Locator.parse(l[1:])
+            elif s[0] in './':
+                from toil.jobStores.fileJobStore import FileJobStore
+                return FileJobStore.Locator.parse([s])
+            else:
+                raise RuntimeError("Unknown job store implementation '%s'" % l[0])
+
+        def __str__(self):
+            return ':'.join(self)
+
+        @classmethod
+        def loadOrCreateJobStore(cls, s, config=None, **kwargs):
+            if isinstance(s, cls):
+                locator = s
+            else:
+                locator = AbstractJobStore.Locator.parse(s)
+            return locator.jobStore(locator, config=config, **kwargs)
+
     def __init__(self, config=None):
         """
         :param toil.common.Config config: If config is not None then the given configuration object will be written
@@ -230,10 +263,10 @@ class AbstractJobStore(object):
             raise JobStoreCreationException("The job store '%s' already exists. Use --restart to "
                                             "resume the workflow, or remove the job store with "
                                             "'toil clean' to start the workflow from scratch" %
-                                            locator)
+                                            str(locator))
         if not create and not exists:
             raise JobStoreCreationException("The job store '%s' does not exist, so there "
-                                            "is nothing to restart." % locator)
+                                            "is nothing to restart." % str(locator))
 
     def importFile(self, srcUrl, sharedFileName=None):
         """
@@ -370,6 +403,13 @@ class AbstractJobStore(object):
     def deleteJobStore(self):
         """
         Removes the job store from the disk/store. Careful!
+        """
+        raise NotImplementedError()
+
+    @abstractclassmethod
+    def cleanJobStore(cls, locator):
+        """
+        Deletes the job store at the given location if it exists without instantiating it.
         """
         raise NotImplementedError()
 

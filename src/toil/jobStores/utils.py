@@ -109,3 +109,24 @@ def retry(delays=(0, 1, 1, 4, 16, 64), timeout=300, predicate=never):
             yield
 
         yield single_attempt()
+
+
+def log_component_failure(e, log, name, attemptNum, maxAttempts=5):
+    log.exception('The following exception was raised during deletion:\n%s',
+                  e.message, exc_info=True)
+    if attemptNum >= maxAttempts:
+        log.error("Too many attempts to delete '%s'. Giving up.", name)
+        return True
+    else:
+        log.debug("Retrying deletion for '%s'...", name)
+        return False
+
+
+def log_delete_completed(log, locator, existed, failure):
+    if existed and not failure:
+        log.info("Successfully deleted job store at location '%s'.", locator)
+    elif not existed:
+        log.info("No job store found at location '%s'.", locator)
+    elif failure:
+        log.error("Completed job store deletion at location '%s' with errors see log for details.",
+                  locator)

@@ -22,9 +22,9 @@ import bz2
 import cPickle
 import socket
 import httplib
-import time
 from collections import Iterable, Iterator
 from typing import Callable
+from collections import namedtuple
 from datetime import datetime, timedelta
 
 from ConfigParser import RawConfigParser, NoOptionError
@@ -39,7 +39,7 @@ from bd2k.util import strict_bool
 
 from bd2k.util.threading import ExceptionalThread
 
-from toil.jobStores.utils import retry
+from toil.jobStores.utils import retry, log_component_failure, log_delete_completed
 from toil.jobWrapper import JobWrapper
 from toil.jobStores.abstractJobStore import (AbstractJobStore, NoSuchJobException,
                                              ConcurrentFileModificationException,
@@ -84,30 +84,54 @@ maxAzureTablePropertySize = 64 * 1024
 class AzureJobStore(AbstractJobStore):
     """
     A job store that uses Azure's blob store for file storage and
-    Table Service to store job info with strong consistency."""
+    Table Service to store job info with strong consistency.
+    """
+    class Locator(namedtuple('Locator', ('accountName', 'accountKey', 'namePrefix',
+                                         'tableService', 'blobService')), AbstractJobStore.Locator):
+        """
+        Parses a job store locator string into an Azure locator object with the following
+        attributes:
+            * accountName: An Azure account name as a string.
+            * accountKey: The account key that corresponds with the account name as a string.
+            * namePrefix: The name prefix of the job store as a string.
+            * tableService: An Azure table service object.
+            * blobService: An Azure blob service object.
 
-    @classmethod
-    def loadOrCreateJobStore(cls, locator, config=None, **kwargs):
-        account, namePrefix = locator.split(':', 1)
-        if '--' in namePrefix:
-            raise ValueError("Invalid name prefix '%s'. Name prefixes may not contain "
-                             "%s." % (namePrefix, cls.nameSeparator))
+        The syntax for an Azure job store locator string is as follows:
+            azure:<account>:<name prefix>
 
-        if not cls.containerNameRe.match(namePrefix):
-            raise ValueError("Invalid name prefix '%s'. Name prefixes must contain only digits, "
-                             "hyphens or lower-case letters and must not start or end in a "
-                             "hyphen." % namePrefix)
+        For name prefix syntax see exception messages in parse method below below.
+        """
+        @property
+        def jobStore(self):
+            return AzureJobStore
 
-        # Reserve 13 for separator and suffix
-        if len(namePrefix) > cls.maxContainerNameLen - cls.maxNameLen - len(cls.nameSeparator):
-            raise ValueError(("Invalid name prefix '%s'. Name prefixes may not be longer than 50 "
-                              "characters." % namePrefix))
+        @classmethod
+        def parse(cls, l):
+            assert not isinstance(l, str)
+            if len(l) != 2:
+                raise ValueError("The job store locator '%s' is invalid." % ':'.join(l))
+            elif AzureJobStore.nameSeparator in l[1]:
+                raise ValueError("Invalid name prefix '%s'. Name prefixes may not contain %s." %
+                                 (l[1], AzureJobStore.nameSeparator))
+            elif not AzureJobStore.containerNameRe.match(l[1]):
+                raise ValueError("Invalid name prefix '%s'. Name prefixes must contain only "
+                                 "digits, hyphens or lower-case letters and must not start or "
+                                 "end in a hyphen." % l[1])
+            elif (len(l[1]) >
+                  AzureJobStore.maxContainerNameLen -
+                  AzureJobStore.maxNameLen -
+                  len(AzureJobStore.nameSeparator)):
+                raise ValueError(("Invalid name prefix '%s'. Name prefixes may not be longer "
+                                  "than 50 characters." % l[1]))
+            else:
+                key = _fetchAzureAccountKey(l[0])
+                return cls(l[0], key, AzureJobStore._sanitizeTableName(l[1]),
+                           TableService(account_key=key, account_name=l[0]),
+                           BlobService(account_key=key, account_name=l[0]))
 
-        if '--' in namePrefix:
-            raise ValueError("Invalid name prefix '%s'. Name prefixes may not contain "
-                             "%s." % (namePrefix, cls.nameSeparator))
-
-        return cls(account, namePrefix, config=config, **kwargs)
+        def __str__(self):
+            return ':'.join(('azure', self.accountName, self.namePrefix))
 
     # Dots in container names should be avoided because container names are used in HTTPS bucket
     # URLs where the may interfere with the certificate common name. We use a double
@@ -124,39 +148,23 @@ class AzureJobStore(AbstractJobStore):
 
     # Do not invoke the constructor, use the factory method above.
 
-    def __init__(self, accountName, namePrefix, config=None,
-                 jobChunkSize=maxAzureTablePropertySize):
+    def __init__(self, locator, config=None, jobChunkSize=maxAzureTablePropertySize):
+        self.locator = locator
+        logger.debug("Creating job store at location '%s'", self.locator)
         self.jobChunkSize = jobChunkSize
         self.keyPath = None
-
-        self.account_key = _fetchAzureAccountKey(accountName)
-        self.accountName = accountName
-        # Table names have strict requirements in Azure
-        self.namePrefix = self._sanitizeTableName(namePrefix)
-        logger.debug("Creating job store with name prefix '%s'" % self.namePrefix)
-
-        # These are the main API entrypoints.
-        self.tableService = TableService(account_key=self.account_key, account_name=accountName)
-        self.blobService = BlobService(account_key=self.account_key, account_name=accountName)
-
-        exists = self._jobStoreExists()
-        self._checkJobStoreCreation(config is not None, exists, accountName + ":" + self.namePrefix)
-
+        self._checkJobStoreCreation(config is not None, self._jobStoreExists(), self.locator)
         # Serialized jobs table
         self.jobItems = self._getOrCreateTable(self.qualify('jobs'))
         # Job<->file mapping table
         self.jobFileIDs = self._getOrCreateTable(self.qualify('jobFileIDs'))
-
         # Container for all shared and unshared files
         self.files = self._getOrCreateBlobContainer(self.qualify('files'))
-
         # Stats and logging strings
         self.statsFiles = self._getOrCreateBlobContainer(self.qualify('statsfiles'))
         # File IDs that contain stats and logging strings
         self.statsFileIDs = self._getOrCreateTable(self.qualify('statsFileIDs'))
-
         super(AzureJobStore, self).__init__(config=config)
-
         if self.config.cseKey is not None:
             self.keyPath = self.config.cseKey
 
@@ -164,7 +172,7 @@ class AzureJobStore(AbstractJobStore):
     jobIDLength = len(str(uuid.uuid4()))
 
     def qualify(self, name):
-        return self.namePrefix + self.nameSeparator + name
+        return self.locator.namePrefix + self.nameSeparator + name
 
     def jobs(self):
 
@@ -220,13 +228,6 @@ class AzureJobStore(AbstractJobStore):
             jobStoreFileID = fileEntity.RowKey
             self.deleteFile(jobStoreFileID)
 
-    def deleteJobStore(self):
-        self.jobItems.delete_table()
-        self.jobFileIDs.delete_table()
-        self.files.delete_container()
-        self.statsFiles.delete_container()
-        self.statsFileIDs.delete_table()
-
     def _jobStoreExists(self):
         """
         Checks if job store exists by querying the existence of the statsFileIDs table. Note that
@@ -235,7 +236,7 @@ class AzureJobStore(AbstractJobStore):
         for attempt in retry_azure():
             with attempt:
                 try:
-                    table = self.tableService.query_tables(table_name=self.qualify('statsFileIDs'))
+                    table = self.locator.tableService.query_tables(self.qualify('statsFileIDs'))
                     return table is not None
                 except AzureMissingResourceHttpError as e:
                     if e.status_code == 404:
@@ -243,8 +244,64 @@ class AzureJobStore(AbstractJobStore):
                     else:
                         raise
 
+    def deleteJobStore(self):
+        self.cleanJobStore(self.locator)
+
+    @classmethod
+    def cleanJobStore(cls, locator):
+        i = 0
+        existed = False
+        failure = False
+        for name in ('files', 'statsfiles'):
+            qualifiedName = '%s%s%s' % (locator.namePrefix, cls.nameSeparator, name)
+            logger.debug("Attempting to delete job store container '%s' if it exists...",
+                         qualifiedName)
+            while True:
+                try:
+                    for attempt in retry_azure():
+                        with attempt:
+                            locator.blobService.delete_container(qualifiedName)
+                except Exception as e:
+                    if isinstance(e, AzureMissingResourceHttpError) and e.status_code == 404:
+                        break
+                    else:
+                        existed = True
+                        i += 1
+                        if log_component_failure(e, logger, name, i):
+                            i = 0
+                            failure = True
+                            break
+                else:
+                    existed = True
+                    logger.debug("Successfully deleted job store container '%s'.", qualifiedName)
+                    break
+
+        for name in ('jobItems', 'jobFileIDs', 'statsFileIDs'):  # statsFileIDs must be last
+            qualifiedName = '%s%s%s' % (locator.namePrefix, cls.nameSeparator, name)
+            logger.debug("Attempting to delete job store table '%s' if it exists...", qualifiedName)
+            while True:
+                try:
+                    for attempt in retry_azure():
+                        with attempt:
+                            locator.tableService.delete_table(qualifiedName)
+                except Exception as e:
+                    if isinstance(e, AzureMissingResourceHttpError) and e.status_code == 404:
+                        break
+                    else:
+                        existed = True
+                        i += 1
+                        if log_component_failure(e, logger, name, i):
+                            i = 0
+                            failure = True
+                            break
+                else:
+                    existed = True
+                    logger.debug("Successfully deleted job store table '%s'.", qualifiedName)
+                    break
+        log_delete_completed(logger, locator, existed, failure)
+
     def getEnv(self):
-        return dict(AZURE_ACCOUNT_KEY=self.account_key)
+        return dict(AZURE_ACCOUNT_KEY=self.locator.accountKey)
 
     @classmethod
     def _readFromUrl(cls, url, writable):
@@ -456,16 +513,17 @@ class AzureJobStore(AbstractJobStore):
         # This will not fail if the table already exists.
         for attempt in retry_azure():
             with attempt:
-                self.tableService.create_table(tableName)
-        return AzureTable(self.tableService, tableName)
+                self.locator.tableService.create_table(tableName)
+        return AzureTable(self.locator.tableService, tableName)
 
     def _getOrCreateBlobContainer(self, containerName):
         for attempt in retry_azure():
             with attempt:
-                self.blobService.create_container(containerName)
-        return AzureBlobContainer(self.blobService, containerName)
+                self.locator.blobService.create_container(containerName)
+        return AzureBlobContainer(self.locator.blobService, containerName)
 
-    def _sanitizeTableName(self, tableName):
+    @staticmethod
+    def _sanitizeTableName(tableName):
         """
         Azure table names must start with a letter and be alphanumeric.
 

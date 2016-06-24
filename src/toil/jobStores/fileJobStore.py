@@ -23,10 +23,13 @@ import os
 import tempfile
 import stat
 import errno
+
+from toil.jobStores.utils import log_delete_completed
 from toil.lib.bioio import absSymPath
 from toil.jobStores.abstractJobStore import (AbstractJobStore, NoSuchJobException,
                                              NoSuchFileException)
 from toil.jobWrapper import JobWrapper
+from collections import namedtuple
 
 logger = logging.getLogger( __name__ )
 
@@ -36,35 +39,71 @@ class FileJobStore(AbstractJobStore):
     Represents the toil using a network file system. For doc-strings of functions see
     AbstractJobStore.
     """
+    class Locator(namedtuple('Locator', ('jobStoreDir',)), AbstractJobStore.Locator):
+        """
+        Parses a job store locator string into a File locator object containing the following
+        attribute:
+            * jobStoreDir: The path of the job store directory as a string.
 
-    def __init__(self, jobStoreDir, config=None):
+        The syntax for a File job store locator string is as follows:
+            file:<file path>
+
+        Note that for backwards compatibility a file path '/f' or './f' is equivalent
+        to 'file:/f' or 'file:./f' respectively.
+
+        For name prefix syntax see exception messages in parse method below.
+        """
+        @property
+        def jobStore(self):
+            return FileJobStore
+
+        @classmethod
+        def parse(cls, l):
+            assert not isinstance(l, str)
+            if len(l) != 1:
+                raise ValueError("The job store locator '%s' is invalid." % ':'.join(l))
+            else:
+                return cls(absSymPath(l[0]))
+
+        def __str__(self):
+            return ':'.join(('file', self.jobStoreDir))
+
+    # Parameters for creating temporary files.
+    validDirs = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
+    levels = 2
+
+    def __init__(self, locator, config=None):
         """
         :param jobStoreDir: Place to create jobStore
         :param config: See jobStores.abstractJobStore.AbstractJobStore.__init__
-        :raise RuntimeError: if config != None and the jobStore already exists or
-        config == None and the jobStore does not already exists. 
+        :raise JobStoreCreationException: if config != None and the jobStore already exists or
+               config == None and the jobStore does not already exists.
         """
-        # This is root directory in which everything in the store is kept
-        self.jobStoreDir = absSymPath(jobStoreDir)
-        logger.info("Jobstore directory is: %s", self.jobStoreDir)
-        # Safety checks for existing jobStore
+        self.locator = locator
+        logger.debug("Creating job store at location '%s'", self.locator)
         self._checkJobStoreCreation(create=config is not None,
-                                    exists=os.path.exists(self.jobStoreDir),
-                                    locator=self.jobStoreDir)
-        # Directory where temporary files go
-        self.tempFilesDir = os.path.join(self.jobStoreDir, "tmp")
-        # Creation of jobStore, if necessary
+                                    exists=os.path.exists(self.locator.jobStoreDir),
+                                    locator=self.locator)
+        self.tempFilesDir = os.path.join(self.locator.jobStoreDir, "tmp")
         if config is not None:
-            os.mkdir(self.jobStoreDir)
+            os.mkdir(self.locator.jobStoreDir)
             os.mkdir(self.tempFilesDir)
-        # Parameters for creating temporary files
-        self.validDirs = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
-        self.levels = 2
         super(FileJobStore, self).__init__(config=config)
 
     def deleteJobStore(self):
-        if os.path.exists(self.jobStoreDir):
-            shutil.rmtree(self.jobStoreDir)
+        self.cleanJobStore(self.locator)
+
+    @classmethod
+    def cleanJobStore(cls, locator):
+        failure = False
+        existed = os.path.exists(locator.jobStoreDir)
+        try:
+            shutil.rmtree(locator.jobStoreDir, ignore_errors=True)
+        except Exception as e:
+            logger.exception('The following exception was raised during deletion:\n%s',
+                             e.message, exc_info=True)
+            failure = True
+        log_delete_completed(logger, locator, existed, failure)
 
     ##########################################
     # The following methods deal with creating/loading/updating/writing/checking for the
@@ -99,7 +138,7 @@ class FileJobStore(AbstractJobStore):
             raise NoSuchFileException(jobStoreFileID)
 
     def getSharedPublicUrl(self, sharedFileName):
-        jobStorePath = self.jobStoreDir + '/' + sharedFileName
+        jobStorePath = self.locator.jobStoreDir + '/' + sharedFileName
         if os.path.exists(jobStorePath):
             return 'file:' + jobStorePath
         else:
@@ -278,14 +317,14 @@ class FileJobStore(AbstractJobStore):
     def writeSharedFileStream(self, sharedFileName, isProtected=None):
         # the isProtected parameter has no effect on the fileStore
         assert self._validateSharedFileName( sharedFileName )
-        with open( os.path.join( self.jobStoreDir, sharedFileName ), 'w' ) as f:
+        with open( os.path.join( self.locator.jobStoreDir, sharedFileName ), 'w' ) as f:
             yield f
 
     @contextmanager
     def readSharedFileStream(self, sharedFileName):
         assert self._validateSharedFileName( sharedFileName )
         try:
-            with open(os.path.join(self.jobStoreDir, sharedFileName), 'r') as f:
+            with open(os.path.join(self.locator.jobStoreDir, sharedFileName), 'r') as f:
                 yield f
         except IOError as e:
             if e.errno == errno.ENOENT:
